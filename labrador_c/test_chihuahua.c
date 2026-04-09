@@ -13,11 +13,11 @@
 #define LAB_N 64
 #define LAB_DEG 1
 #define PLOVER_COEFFS 2048
-#define CHUNKS (PLOVER_COEFFS / LAB_N)      // 32
-#define R_VEC (4 * CHUNKS)                  // 128 个 witness 向量 (每个向量 1 个多项式)
-#define K_CONSTRAINTS CHUNKS                // 32 个线性约束
-// jlproj.h 中 JLMAXNORM = min(..., 1<<28) => JLMAXNORMSQ = 1<<56
-#define SAFE_MAX_NORMSQ ((1ULL << 56) - 1)  
+#define CHUNKS (PLOVER_COEFFS / LAB_N)      // 32 个数据块
+#define R_VEC (4 * CHUNKS)                  // 128 个见证向量 (每个向量 1 个多项式)
+#define K_CONSTRAINTS CHUNKS                // 32 个独立线性约束
+#define SLACK_FACTOR 4.27                   // LaBRADOR 知识声音性松弛因子 (~128/30)
+#define SAFE_MAX_NORMSQ ((1ULL << 56) - 1)  // JLMAXNORMSQ 安全上限 (LOGQ=48 时为 2^56)
 
 static double get_time_ms(void) {
     struct timeval tv;
@@ -41,7 +41,7 @@ static char* read_file_to_string(const char* filename) {
 }
 
 // 辅助：将 2048 系数安全装载到 LaBRADOR 的 witness 中
-// 修复：每个 witness 向量对应 1 个多项式 (n=1)，避免 set_witness_vector_raw 越界
+// 【修复】每个 witness 向量对应 1 个多项式 (n=1)，避免底层读取越界
 static void load_chunked_vector(witness *wt, size_t base_idx, const cJSON *arr) {
     int64_t tmp[LAB_N];
     for (size_t chunk = 0; chunk < CHUNKS; chunk++) {
@@ -71,9 +71,9 @@ void run_plover_labrador_zkp(const char* json_filepath) {
     int64_t q_plover = (int64_t)cJSON_GetObjectItem(stmt_json, "q_plover")->valuedouble;
 
     // 【核心修复 1】n_arr 必须长度为 R_VEC (128)，且每个向量秩为 1 (1个多项式)
+    // LaBRADOR 的 N=64 是硬编码的，n[i] 表示多项式个数，不是系数个数！
     size_t n_arr[R_VEC];
     for(size_t i=0; i<R_VEC; i++) n_arr[i] = 1;
-    size_t idx[4] = {0, 1, 2, 3};
 
     // 分配约束系数 (32 约束 × 4 变量 × 64 系数)
     int64_t *phi = (int64_t *)calloc(K_CONSTRAINTS * 4 * LAB_N, sizeof(int64_t));
@@ -83,22 +83,20 @@ void run_plover_labrador_zkp(const char* json_filepath) {
     cJSON *arr_t = cJSON_GetObjectItem(stmt_json, "t");
     cJSON *arr_u = cJSON_GetObjectItem(stmt_json, "u");
 
-    // 构建块对角约束矩阵
-    for (size_t chunk = 0; chunk < CHUNKS; chunk++) {
-        size_t base_phi = chunk * 4 * LAB_N;
-        size_t base_b = chunk * LAB_N;
+    // 【核心修复 2】构建 32 个独立的块对角约束矩阵
+    for (size_t blk = 0; blk < K_CONSTRAINTS; blk++) {
+        size_t base_phi = blk * 4 * LAB_N;
+        size_t base_b = blk * LAB_N;
         for (size_t i = 0; i < LAB_N; i++) {
-            phi[base_phi + 0 * LAB_N + i] = (int64_t)cJSON_GetArrayItem(arr_A, chunk * LAB_N + i)->valuedouble;
-            phi[base_phi + 1 * LAB_N + i] = (int64_t)cJSON_GetArrayItem(arr_t, chunk * LAB_N + i)->valuedouble;
-            b_vec[base_b + i] = (int64_t)cJSON_GetArrayItem(arr_u, chunk * LAB_N + i)->valuedouble;
-        }
-        for (int i = 0; i < LAB_N; i++) {
+            phi[base_phi + 0 * LAB_N + i] = (int64_t)cJSON_GetArrayItem(arr_A, blk * LAB_N + i)->valuedouble;
+            phi[base_phi + 1 * LAB_N + i] = (int64_t)cJSON_GetArrayItem(arr_t, blk * LAB_N + i)->valuedouble;
+            b_vec[base_b + i] = (int64_t)cJSON_GetArrayItem(arr_u, blk * LAB_N + i)->valuedouble;
             phi[base_phi + 2 * LAB_N + i] = 1;          // z1 系数全为 1
             phi[base_phi + 3 * LAB_N + i] = -q_plover;  // k 系数全为 -q
         }
     }
 
-    // 计算并安全钳位范数
+    // 计算真实范数平方 (替代 infinite_beta)
     double total_sq = 0.0;
     const char *wit_names[4] = {"z2", "c1", "z1", "k"};
     for(int j=0; j<4; j++) {
@@ -108,7 +106,7 @@ void run_plover_labrador_zkp(const char* json_filepath) {
             total_sq += val * val;
         }
     }
-    uint64_t betasq = (uint64_t)ceil(total_sq * 4.27);
+    uint64_t betasq = (uint64_t)ceil(total_sq * SLACK_FACTOR);
     if (betasq > SAFE_MAX_NORMSQ || betasq == 0) {
         printf("[!] 兼容提示: 签名范数超出 LaBRADOR JLMAXNORMSQ 限制，已自动钳位至 2^56-1\n");
         betasq = SAFE_MAX_NORMSQ;
@@ -121,8 +119,8 @@ void run_plover_labrador_zkp(const char* json_filepath) {
         goto cleanup;
     }
 
-    // 【核心修复 2】传递长度为 4 的 lens 数组，每个约束关联 4 个秩为 1 的向量
-    size_t lens[4] = {1, 1, 1, 1};
+    // 【核心修复 3】必须初始化全部 32 个约束！原代码只循环了 4 次导致验证崩溃
+    size_t lens[4] = {1, 1, 1, 1}; // 每个约束关联 4 个秩为 1 的向量
     for(size_t blk=0; blk<K_CONSTRAINTS; blk++) {
         size_t chunk_idx[4] = {blk*4, blk*4+1, blk*4+2, blk*4+3};
         set_prncplstmnt_lincnst_raw(&st, blk, 4, chunk_idx, lens, LAB_DEG, 
