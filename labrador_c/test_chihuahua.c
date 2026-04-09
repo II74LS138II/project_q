@@ -9,39 +9,73 @@
 #include "chihuahua.h"
 #include "cJSON.h"
 
-// 严格对齐底层分块逻辑
+// 严格对齐 LaBRADOR 底层参数
 #define LAB_N 64
 #define LAB_DEG 1
 #define PLOVER_COEFFS 2048
 #define CHUNKS (PLOVER_COEFFS / LAB_N)      // 32
-#define R_VEC (4 * CHUNKS)                  // 128 个 witness 向量
-#define K_CONSTRAINTS CHUNKS                // 32 个独立线性约束
+#define R_VEC (4 * CHUNKS)                  // 128 个 witness 向量 (每个向量 1 个多项式)
+#define K_CONSTRAINTS CHUNKS                // 32 个线性约束
 // jlproj.h 中 JLMAXNORM = min(..., 1<<28) => JLMAXNORMSQ = 1<<56
 #define SAFE_MAX_NORMSQ ((1ULL << 56) - 1)  
 
-// 辅助函数原型
-static void load_chunked_vector(witness *wt, size_t base_idx, const cJSON *arr);
-static double get_time_ms(void);
-static char* read_file_to_string(const char* filename);
-void run_plover_labrador_zkp(const char*);
+static double get_time_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec * 1000.0 + (double)tv.tv_usec / 1000.0;
+}
 
+static char* read_file_to_string(const char* filename) {
+    FILE *f = fopen(filename, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long length = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *data = malloc(length + 1);
+    if (data) {
+        size_t r = fread(data, 1, length, f);
+        data[r] = '\0';
+    }
+    fclose(f);
+    return data;
+}
+
+// 辅助：将 2048 系数安全装载到 LaBRADOR 的 witness 中
+// 修复：每个 witness 向量对应 1 个多项式 (n=1)，避免 set_witness_vector_raw 越界
+static void load_chunked_vector(witness *wt, size_t base_idx, const cJSON *arr) {
+    int64_t tmp[LAB_N];
+    for (size_t chunk = 0; chunk < CHUNKS; chunk++) {
+        for (size_t i = 0; i < LAB_N; i++) {
+            tmp[i] = (int64_t)cJSON_GetArrayItem(arr, chunk * LAB_N + i)->valuedouble;
+        }
+        // n=1, deg=1 精确匹配 polyvec_fromint64vec 期望的 tmp[64]
+        set_witness_vector_raw(wt, base_idx + chunk, 1, LAB_DEG, tmp);
+    }
+}
 
 void run_plover_labrador_zkp(const char* json_filepath) {
     char *json_string = read_file_to_string(json_filepath);
-    if (!json_string) { printf("[-] 无法读取 JSON 文件: %s\n", json_filepath); return; }
+    if (!json_string) {
+        printf("[-] 无法读取 JSON 文件: %s\n", json_filepath);
+        return;
+    }
     cJSON *root = cJSON_Parse(json_string);
-    if (!root) { printf("[-] JSON 解析失败\n"); free(json_string); return; }
-
+    if (!root) {
+        printf("[-] JSON 解析失败\n");
+        free(json_string);
+        return;
+    }
     cJSON *item = cJSON_GetArrayItem(root, 0);
     cJSON *stmt_json = cJSON_GetObjectItem(item, "statement");
     cJSON *wit_json = cJSON_GetObjectItem(item, "witness");
     int64_t q_plover = (int64_t)cJSON_GetObjectItem(stmt_json, "q_plover")->valuedouble;
 
-    // 1. 初始化 Witness 长度数组 (必须 128 个，避免越界警告)
+    // 【核心修复 1】n_arr 必须长度为 R_VEC (128)，且每个向量秩为 1 (1个多项式)
     size_t n_arr[R_VEC];
-    for(size_t i=0; i<R_VEC; i++) n_arr[i] = LAB_N;
+    for(size_t i=0; i<R_VEC; i++) n_arr[i] = 1;
+    size_t idx[4] = {0, 1, 2, 3};
 
-    // 2. 分配约束系数 (32 个约束 × 4 变量 × 64 系数)
+    // 分配约束系数 (32 约束 × 4 变量 × 64 系数)
     int64_t *phi = (int64_t *)calloc(K_CONSTRAINTS * 4 * LAB_N, sizeof(int64_t));
     int64_t *b_vec = (int64_t *)calloc(K_CONSTRAINTS * LAB_N, sizeof(int64_t));
 
@@ -58,11 +92,13 @@ void run_plover_labrador_zkp(const char* json_filepath) {
             phi[base_phi + 1 * LAB_N + i] = (int64_t)cJSON_GetArrayItem(arr_t, chunk * LAB_N + i)->valuedouble;
             b_vec[base_b + i] = (int64_t)cJSON_GetArrayItem(arr_u, chunk * LAB_N + i)->valuedouble;
         }
-        phi[base_phi + 2 * LAB_N + 0] = 1;
-        phi[base_phi + 3 * LAB_N + 0] = -q_plover;
+        for (int i = 0; i < LAB_N; i++) {
+            phi[base_phi + 2 * LAB_N + i] = 1;          // z1 系数全为 1
+            phi[base_phi + 3 * LAB_N + i] = -q_plover;  // k 系数全为 -q
+        }
     }
 
-    // 3. 计算并安全钳位范数 (必须 <= 2^56 否则触发 JL 投影检查)
+    // 计算并安全钳位范数
     double total_sq = 0.0;
     const char *wit_names[4] = {"z2", "c1", "z1", "k"};
     for(int j=0; j<4; j++) {
@@ -78,22 +114,22 @@ void run_plover_labrador_zkp(const char* json_filepath) {
         betasq = SAFE_MAX_NORMSQ;
     }
 
-    // 4. 初始化 Statement (k=32 个约束)
+    // 初始化 Statement (k=32 个约束)
     prncplstmnt st;
     if (init_prncplstmnt_raw(&st, R_VEC, n_arr, betasq, K_CONSTRAINTS, 0) != 0) {
         printf("[-] Statement 初始化失败\n");
         goto cleanup;
     }
 
-    // 5. 设置 32 个独立约束 (修复索引与长度参数)
-    size_t lens[4] = {LAB_N, LAB_N, LAB_N, LAB_N};
+    // 【核心修复 2】传递长度为 4 的 lens 数组，每个约束关联 4 个秩为 1 的向量
+    size_t lens[4] = {1, 1, 1, 1};
     for(size_t blk=0; blk<K_CONSTRAINTS; blk++) {
         size_t chunk_idx[4] = {blk*4, blk*4+1, blk*4+2, blk*4+3};
         set_prncplstmnt_lincnst_raw(&st, blk, 4, chunk_idx, lens, LAB_DEG, 
                                    &phi[blk * 4 * LAB_N], &b_vec[blk * LAB_N]);
     }
 
-    // 6. 装载 Witness
+    // 初始化并装载 Witness
     witness wt;
     init_witness_raw(&wt, R_VEC, n_arr);
     load_chunked_vector(&wt, 0, cJSON_GetObjectItem(wit_json, "z2"));
@@ -124,9 +160,7 @@ void run_plover_labrador_zkp(const char* json_filepath) {
 
             printf("[*] 开始验证 ZKP Proof...\n");
             t_start = get_time_ms();
-            // principle_verify 仅用于约束系统校验。LaBRADOR 完整证明验证需配合 reduce 接口
-            // 此处演示验证生成后的 witness 结构是否满足约束
-            int v_ret = principle_verify(&st, &owt);
+            int v_ret = principle_verify(&ost, &owt);
             t_end = get_time_ms();
             printf("[%s] 证明验证结果: %d (耗时: %.2f ms)\n", v_ret==0?"+":"-", v_ret, t_end - t_start);
 
@@ -145,37 +179,6 @@ cleanup:
     free(b_vec);
     cJSON_Delete(root);
     free(json_string);
-}
-
-static double get_time_ms(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (double)tv.tv_sec * 1000.0 + (double)tv.tv_usec / 1000.0;
-}
-
-static char* read_file_to_string(const char* filename) {
-    FILE *f = fopen(filename, "rb");
-    if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
-    long length = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char *data = malloc(length + 1);
-    if (data) {
-        size_t r = fread(data, 1, length, f);
-        data[r] = '\0';
-    }
-    fclose(f);
-    return data;
-}
-
-static void load_chunked_vector(witness *wt, size_t base_idx, const cJSON *arr) {
-    int64_t tmp[LAB_N];
-    for (size_t chunk = 0; chunk < CHUNKS; chunk++) {
-        for (size_t i = 0; i < LAB_N; i++) {
-            tmp[i] = (int64_t)cJSON_GetArrayItem(arr, chunk * LAB_N + i)->valuedouble;
-        }
-        set_witness_vector_raw(wt, base_idx + chunk, LAB_N, LAB_DEG, tmp);
-    }
 }
 
 int main(void) {
