@@ -40,8 +40,7 @@ static char* read_file_to_string(const char* filename) {
     return data;
 }
 
-// 辅助：将 2048 系数安全装载到 LaBRADOR 的 witness 中
-// 【修复】每个 witness 向量对应 1 个多项式 (n=1)，避免底层读取越界
+// 【修复1】正确装载见证向量：n=1 表示 1 个多项式(64系数)，tmp 大小正好匹配
 static void load_chunked_vector(witness *wt, size_t base_idx, const cJSON *arr) {
     int64_t tmp[LAB_N];
     for (size_t chunk = 0; chunk < CHUNKS; chunk++) {
@@ -70,8 +69,7 @@ void run_plover_labrador_zkp(const char* json_filepath) {
     cJSON *wit_json = cJSON_GetObjectItem(item, "witness");
     int64_t q_plover = (int64_t)cJSON_GetObjectItem(stmt_json, "q_plover")->valuedouble;
 
-    // 【核心修复 1】n_arr 必须长度为 R_VEC (128)，且每个向量秩为 1 (1个多项式)
-    // LaBRADOR 的 N=64 是硬编码的，n[i] 表示多项式个数，不是系数个数！
+    // 【修复2】n_arr 必须长度为 R_VEC (128)，且每个向量秩为 1 (1个多项式)
     size_t n_arr[R_VEC];
     for(size_t i=0; i<R_VEC; i++) n_arr[i] = 1;
 
@@ -83,7 +81,7 @@ void run_plover_labrador_zkp(const char* json_filepath) {
     cJSON *arr_t = cJSON_GetObjectItem(stmt_json, "t");
     cJSON *arr_u = cJSON_GetObjectItem(stmt_json, "u");
 
-    // 【核心修复 2】构建 32 个独立的块对角约束矩阵
+    // 【修复3】构建 32 个独立的块对角约束矩阵
     for (size_t blk = 0; blk < K_CONSTRAINTS; blk++) {
         size_t base_phi = blk * 4 * LAB_N;
         size_t base_b = blk * LAB_N;
@@ -119,7 +117,7 @@ void run_plover_labrador_zkp(const char* json_filepath) {
         goto cleanup;
     }
 
-    // 【核心修复 3】必须初始化全部 32 个约束！原代码只循环了 4 次导致验证崩溃
+    // 【修复4】必须初始化全部 32 个约束！原代码只循环了 4 次导致验证崩溃
     size_t lens[4] = {1, 1, 1, 1}; // 每个约束关联 4 个秩为 1 的向量
     for(size_t blk=0; blk<K_CONSTRAINTS; blk++) {
         size_t chunk_idx[4] = {blk*4, blk*4+1, blk*4+2, blk*4+3};
